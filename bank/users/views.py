@@ -1,17 +1,18 @@
 from rest_framework import generics, permissions
+from rest_framework.pagination import CursorPagination
 from rest_framework.response import Response
 
 from .models import User
 from .serializers import (
+    AdminUserCreateSerializer,
+    AdminUserSerializer,
     RegisterSerializer,
     UserSerializer,
     UserUpdateSerializer,
-    AdminUserSerializer,
 )
 
 
 class RegisterView(generics.CreateAPIView):
-    queryset = User.objects.all()
     serializer_class = RegisterSerializer
     permission_classes = [permissions.AllowAny]
 
@@ -23,8 +24,7 @@ class RegisterView(generics.CreateAPIView):
 
 
 class MeView(generics.RetrieveUpdateDestroyAPIView):
-    """Self-service only. There is no path from this view to reach
-    another user's data -- get_object always returns request.user."""
+    """Self-service only -- get_object always returns request.user."""
 
     permission_classes = [permissions.IsAuthenticated]
 
@@ -40,12 +40,24 @@ class MeView(generics.RetrieveUpdateDestroyAPIView):
         instance.soft_delete()
 
 
-class AdminUserListView(generics.ListAPIView):
-    """Staff only. Lists active users by default;
-    ?include_deleted=true also returns soft-deleted accounts."""
+class UserCursorPagination(CursorPagination):
+    page_size = 25
+    max_page_size = 100
+    page_size_query_param = "page_size"
+    ordering = ("-date_joined", "-id")  # -id breaks ties on identical timestamps
 
-    serializer_class = AdminUserSerializer
+
+class AdminUserListView(generics.ListCreateAPIView):
+    """Staff only. GET lists (?include_deleted=true shows soft-deleted too);
+    POST lets staff create a user account directly."""
+
     permission_classes = [permissions.IsAdminUser]
+    pagination_class = UserCursorPagination
+
+    def get_serializer_class(self):
+        if self.request.method == "POST":
+            return AdminUserCreateSerializer
+        return AdminUserSerializer
 
     def get_queryset(self):
         qs = User.objects.all().order_by("-date_joined")
@@ -53,10 +65,15 @@ class AdminUserListView(generics.ListAPIView):
             qs = qs.filter(is_deleted=False)
         return qs
 
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        return Response(AdminUserSerializer(user).data, status=201)
+
 
 class AdminUserDetailView(generics.RetrieveUpdateDestroyAPIView):
-    """Staff only. Full read/edit/soft-delete on any user, looked up
-    by their public bank_user_id (never the internal UUID pk)."""
+    """Staff only. Full CRUD by bank_user_id, not the internal UUID."""
 
     queryset = User.objects.all()
     lookup_field = "bank_user_id"

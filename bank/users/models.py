@@ -3,29 +3,18 @@ import secrets
 import string
 
 from django.contrib.auth.models import AbstractUser, BaseUserManager
-from django.db import models
+from django.db import IntegrityError, models, transaction
 from django.utils import timezone
 
 
 def generate_bank_user_id():
-    """Random, non-derivable bank identifier: 'MB' + 11 random chars.
-
-    Never derived from email, CNIC, passport, name, or DOB. Generated
-    once at account creation and never changed again.
-    """
+    """'MB' + 11 random chars. Non-derivable, immutable."""
     alphabet = string.ascii_uppercase + string.digits
     return "MB" + "".join(secrets.choice(alphabet) for _ in range(11))
 
 
 class UserManager(BaseUserManager):
-    """Custom manager: AbstractUser's default manager assumes a
-    `username` field, which this model does not have.
-
-    Deliberately unfiltered (includes soft-deleted rows) -- filtering
-    the default manager would silently break Django's authentication
-    lookups and DRF's automatic uniqueness validation, which both use
-    `_default_manager` internally.
-    """
+    """AbstractUser's default manager assumes `username`; we don't have one."""
 
     use_in_migrations = True
 
@@ -43,24 +32,32 @@ class UserManager(BaseUserManager):
         if not cnic and not passport_number:
             raise ValueError("Either CNIC or passport number is required")
 
-        bank_user_id = generate_bank_user_id()
-        while self.model.objects.filter(bank_user_id=bank_user_id).exists():
-            bank_user_id = generate_bank_user_id()
-
         email = self.normalize_email(email)
-        user = self.model(
-            email=email,
-            phone_number=phone_number,
-            first_name=first_name,
-            last_name=last_name,
-            cnic=cnic,
-            passport_number=passport_number,
-            bank_user_id=bank_user_id,
-            **extra_fields,
-        )
-        user.set_password(password)
-        user.save(using=self._db)
-        return user
+
+        # Retry on the actual DB collision rather than a racy pre-check.
+        for _ in range(5):
+            user = self.model(
+                email=email,
+                phone_number=phone_number,
+                first_name=first_name,
+                last_name=last_name,
+                cnic=cnic,
+                passport_number=passport_number,
+                bank_user_id=generate_bank_user_id(),
+                **extra_fields,
+            )
+            user.set_password(password)
+            try:
+                with transaction.atomic():
+                    user.save(using=self._db)
+                return user
+            except IntegrityError as exc:
+                constraint = getattr(getattr(exc.__cause__, "diag", None), "constraint_name", "") or ""
+                if "bank_user_id" in constraint:
+                    continue
+                raise
+
+        raise RuntimeError("Could not generate a unique bank_user_id after 5 attempts")
 
     def create_user(self, email, password=None, phone_number=None, first_name=None,
                      last_name=None, cnic=None, passport_number=None, **extra_fields):
@@ -105,7 +102,11 @@ class User(AbstractUser):
     deleted_at = models.DateTimeField(null=True, blank=True)
 
     USERNAME_FIELD = "email"
-    REQUIRED_FIELDS = ["phone_number", "first_name", "last_name"]
+    # cnic here (not passport_number) so `createsuperuser` prompts for the
+    # field that satisfies cnic_or_passport_required -- it only knows to ask
+    # about fields listed here, otherwise create_superuser() gets neither and
+    # raises ValueError.
+    REQUIRED_FIELDS = ["phone_number", "first_name", "last_name", "cnic"]
 
     objects = UserManager()
 
@@ -116,17 +117,15 @@ class User(AbstractUser):
                 name="cnic_or_passport_required",
             )
         ]
+        indexes = [
+            models.Index(fields=["date_joined"], name="user_date_joined_idx"),
+        ]
 
     def __str__(self):
         return self.email
 
     def soft_delete(self):
-        """Never physically remove a banking user record. Deactivates
-        login (is_active=False, enforced by Django's auth backend) and
-        stamps deleted_at, but keeps the row -- and its unique email /
-        phone / CNIC / passport / bank_user_id -- permanently reserved
-        so none of it can be silently reused by a new signup.
-        """
+        """Deactivate + flag deleted. Never hard-delete a user row."""
         self.is_deleted = True
         self.is_active = False
         self.deleted_at = timezone.now()
