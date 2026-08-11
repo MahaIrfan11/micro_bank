@@ -40,9 +40,7 @@ class Account(models.Model):
                 condition=models.Q(balance_minor__gte=0),
                 name="account_balance_never_negative",
             ),
-            # DB-enforced: at most one CURRENT and one SAVINGS account per
-            # owner. Scoped to is_deleted=False (partial index) so a closed
-            # account doesn't permanently block reopening that type later.
+            # One CURRENT + one SAVINGS per owner; scoped to non-deleted accounts.
             models.UniqueConstraint(
                 fields=["owner", "account_type"],
                 condition=models.Q(is_deleted=False),
@@ -122,8 +120,7 @@ class Transfer(models.Model):
 
 
 class Deposit(models.Model):
-    """Idempotency record for AccountDepositView. Not a ledger Entry --
-    deposits stay outside the double-entry conservation invariant."""
+    """Idempotency record for deposits -- not a ledger Entry."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     idempotency_key = models.CharField(max_length=255, unique=True)

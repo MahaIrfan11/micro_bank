@@ -1,4 +1,5 @@
 from rest_framework import generics, permissions
+from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import CursorPagination
 from rest_framework.response import Response
 
@@ -10,6 +11,15 @@ from .serializers import (
     UserSerializer,
     UserUpdateSerializer,
 )
+
+
+def _soft_delete_or_raise(instance):
+    """Refuse to delete a user who still holds any open account."""
+    if instance.accounts.filter(is_deleted=False).exists():
+        raise ValidationError(
+            {"detail": "Cannot delete a user who still has an account. Close their accounts first."}
+        )
+    instance.soft_delete()
 
 
 class RegisterView(generics.CreateAPIView):
@@ -37,7 +47,7 @@ class MeView(generics.RetrieveUpdateDestroyAPIView):
         return UserSerializer
 
     def perform_destroy(self, instance):
-        instance.soft_delete()
+        _soft_delete_or_raise(instance)
 
 
 class UserCursorPagination(CursorPagination):
@@ -85,4 +95,4 @@ class AdminUserDetailView(generics.RetrieveUpdateDestroyAPIView):
         return AdminUserSerializer
 
     def perform_destroy(self, instance):
-        instance.soft_delete()
+        _soft_delete_or_raise(instance)

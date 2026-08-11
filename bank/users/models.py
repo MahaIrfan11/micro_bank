@@ -102,10 +102,7 @@ class User(AbstractUser):
     deleted_at = models.DateTimeField(null=True, blank=True)
 
     USERNAME_FIELD = "email"
-    # cnic here (not passport_number) so `createsuperuser` prompts for the
-    # field that satisfies cnic_or_passport_required -- it only knows to ask
-    # about fields listed here, otherwise create_superuser() gets neither and
-    # raises ValueError.
+    # cnic here so createsuperuser prompts for it (satisfies cnic_or_passport_required).
     REQUIRED_FIELDS = ["phone_number", "first_name", "last_name", "cnic"]
 
     objects = UserManager()
@@ -129,4 +126,4 @@ class User(AbstractUser):
         self.is_deleted = True
         self.is_active = False
         self.deleted_at = timezone.now()
-        self.save(using=self._db, update_fields=["is_deleted", "is_active", "deleted_at"])
+        self.save(update_fields=["is_deleted", "is_active", "deleted_at"])

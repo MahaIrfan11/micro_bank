@@ -18,16 +18,15 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / '.env')
 
-# Quick-start development settings - unsuitable for production
-# See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
+# Set a real value in .env -- fallback below is local-dev only.
+SECRET_KEY = os.environ.get(
+    'SECRET_KEY', 'django-insecure-local-dev-only-set-SECRET_KEY-in-.env'
+)
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-as$!=ld&6e1m$cknubwd3)_8uuwv!e+^vkuy7c=c18cl!7!l#m'
+DEBUG = os.environ.get('DEBUG', 'True') == 'True'
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
-
-ALLOWED_HOSTS = []
+# Comma-separated in .env; empty is fine while DEBUG=True.
+ALLOWED_HOSTS = [h.strip() for h in os.environ.get('ALLOWED_HOSTS', '').split(',') if h.strip()]
 
 
 # Application definition

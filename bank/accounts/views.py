@@ -141,8 +141,7 @@ class TransferView(APIView):
 
         with transaction.atomic():
             try:
-                # Nested atomic() = savepoint; a failure here doesn't
-                # poison the outer transaction.
+                # Savepoint -- failure here doesn't poison the outer transaction.
                 with transaction.atomic():
                     transfer = Transfer.objects.create(
                         idempotency_key=idempotency_key,
@@ -272,8 +271,7 @@ class AccountDepositView(APIView):
 
         with transaction.atomic():
             try:
-                # Nested atomic() = savepoint; a failure here doesn't
-                # poison the outer transaction (same pattern as TransferView).
+                # Savepoint -- failure here doesn't poison the outer transaction.
                 with transaction.atomic():
                     Deposit.objects.create(
                         idempotency_key=idempotency_key,

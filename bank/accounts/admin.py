@@ -24,8 +24,7 @@ class AccountAdmin(admin.ModelAdmin):
     ]
     list_filter = ["account_type", "is_active", "is_deleted", "currency"]
     search_fields = ["account_number", "owner__email"]
-    # balance_minor stays readonly here -- the only sanctioned way to move
-    # money is through TransferView/AccountDepositView, never a manual edit.
+    # balance_minor readonly -- only TransferView/AccountDepositView may change it.
     readonly_fields = ["id", "account_number", "balance_minor", "created_at", "updated_at"]
 
     @admin.display(description="Owner")
