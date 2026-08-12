@@ -86,7 +86,9 @@ class AccountTransactionsView(generics.ListAPIView):
             return Entry.objects.none()
         return (
             Entry.objects.filter(account=account)
-            .select_related("transfer", "transfer__source_account", "transfer__destination_account")
+            .select_related(
+                "transfer", "transfer__source_account", "transfer__destination_account", "deposit"
+            )
             .order_by("-created_at")
         )
 
@@ -232,15 +234,25 @@ class TransferDetailView(generics.RetrieveAPIView):
         return qs.filter(Q(source_account__owner=user) | Q(destination_account__owner=user))
 
 
-class AccountDepositView(APIView):
-    """Staff-only, idempotent. Seeds test balances -- not part of the
-    double-entry ledger, so deliberately outside the conservation invariant."""
+class IsSuperUser(permissions.BasePermission):
+    """Stricter than IsAdminUser (is_staff) -- only a true superuser is the bank."""
 
-    permission_classes = [permissions.IsAdminUser]
+    def has_permission(self, request, view):
+        return bool(request.user and request.user.is_authenticated and request.user.is_superuser)
+
+
+class AccountDepositView(APIView):
+    """Superuser-only, idempotent, and only into the caller's own account.
+    This is the sole entry point where new money enters the system. Every
+    customer account gets funded via TransferView instead (source = the
+    superuser's own account), so that movement is an ordinary, ledger-visible
+    transfer -- only the initial injection here stays outside the ledger."""
+
+    permission_classes = [IsSuperUser]
 
     @extend_schema(
         request=DepositSerializer,
-        responses={200: AccountSerializer, 400: None, 404: None, 409: None},
+        responses={200: AccountSerializer, 400: None, 403: None, 404: None, 409: None},
         parameters=[
             OpenApiParameter(
                 name="Idempotency-Key",
@@ -269,11 +281,17 @@ class AccountDepositView(APIView):
         except Account.DoesNotExist:
             return Response({"detail": "Account not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        if account.owner_id != request.user.id:
+            return Response(
+                {"detail": "You can only deposit into your own account."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         with transaction.atomic():
             try:
                 # Savepoint -- failure here doesn't poison the outer transaction.
                 with transaction.atomic():
-                    Deposit.objects.create(
+                    deposit = Deposit.objects.create(
                         idempotency_key=idempotency_key,
                         account=account,
                         amount_minor=amount_minor,
@@ -294,5 +312,13 @@ class AccountDepositView(APIView):
             account = Account.objects.select_for_update().get(pk=account.pk)
             account.balance_minor += amount_minor
             account.save(update_fields=["balance_minor", "updated_at"])
+
+            # Single-sided entry -- money entering from outside, no counterparty account.
+            Entry.objects.create(
+                deposit=deposit,
+                account=account,
+                amount_minor=amount_minor,
+                balance_after_minor=account.balance_minor,
+            )
 
         return Response(AccountSerializer(account).data, status=status.HTTP_200_OK)

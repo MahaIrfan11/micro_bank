@@ -120,7 +120,8 @@ class Transfer(models.Model):
 
 
 class Deposit(models.Model):
-    """Idempotency record for deposits -- not a ledger Entry."""
+    """Idempotency record for deposits. Each successful deposit also gets a
+    single-sided Entry (see below) so it's visible in transaction history."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     idempotency_key = models.CharField(max_length=255, unique=True)
@@ -146,11 +147,17 @@ class Deposit(models.Model):
 
 
 class Entry(models.Model):
-    """Append-only ledger line. Two per transfer, sum to zero."""
+    """Append-only ledger line. Two per transfer (sum to zero), or one per
+    deposit (money entering the system -- no counterparty to balance against)."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
-    transfer = models.ForeignKey(Transfer, on_delete=models.PROTECT, related_name="entries")
+    transfer = models.ForeignKey(
+        Transfer, on_delete=models.PROTECT, related_name="entries", null=True, blank=True
+    )
+    deposit = models.ForeignKey(
+        Deposit, on_delete=models.PROTECT, related_name="entries", null=True, blank=True
+    )
     account = models.ForeignKey(Account, on_delete=models.PROTECT, related_name="entries")
 
     amount_minor = models.BigIntegerField()  # negative = debit, positive = credit
@@ -162,6 +169,16 @@ class Entry(models.Model):
         ordering = ["-created_at"]
         indexes = [
             models.Index(fields=["account", "-created_at"]),
+        ]
+        constraints = [
+            # Every entry traces to exactly one origin -- a transfer or a deposit, never both/neither.
+            models.CheckConstraint(
+                condition=(
+                    models.Q(transfer__isnull=False, deposit__isnull=True)
+                    | models.Q(transfer__isnull=True, deposit__isnull=False)
+                ),
+                name="entry_has_exactly_one_origin",
+            ),
         ]
 
     def __str__(self):

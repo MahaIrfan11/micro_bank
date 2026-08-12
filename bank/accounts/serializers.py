@@ -49,7 +49,7 @@ class AccountSerializer(serializers.ModelSerializer):
 class EntrySerializer(serializers.ModelSerializer):
     amount = serializers.SerializerMethodField()
     balance_after = serializers.SerializerMethodField()
-    transfer_id = serializers.UUIDField(source="transfer.id", read_only=True)
+    transfer_id = serializers.SerializerMethodField()
     direction = serializers.SerializerMethodField()
     counterparty_account_number = serializers.SerializerMethodField()
 
@@ -75,7 +75,14 @@ class EntrySerializer(serializers.ModelSerializer):
     def get_direction(self, obj):
         return "credit" if obj.amount_minor > 0 else "debit"
 
+    def get_transfer_id(self, obj):
+        # None for deposit-originated entries -- there's no Transfer to point at.
+        return obj.transfer_id
+
     def get_counterparty_account_number(self, obj):
+        if obj.transfer_id is None:
+            # Deposit-originated -- money entering the system, no counterparty account.
+            return "EXTERNAL"
         transfer = obj.transfer
         if obj.amount_minor > 0:
             return transfer.source_account.account_number

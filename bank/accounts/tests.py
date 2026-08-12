@@ -151,21 +151,26 @@ class TransferAPITests(APITestCase):
 
 
 class DepositAPITests(APITestCase):
+    """Only a superuser can deposit, and only into their own (bank) account."""
+
     def setUp(self):
+        self.admin = make_user("admin2@example.com", is_staff=True, is_superuser=True)
         self.staff = make_user("staff2@example.com", is_staff=True)
         self.alice = make_user("alice2@example.com")
+        self.bank_account = Account.objects.create(owner=self.admin, account_type="CURRENT")
         self.account = Account.objects.create(owner=self.alice, account_type="CURRENT")
-        self.client.force_authenticate(user=self.staff)
+        self.client.force_authenticate(user=self.admin)
 
-    def _deposit(self, idem_key, amount="50.00"):
+    def _deposit(self, idem_key, amount="50.00", account=None):
+        account = account or self.bank_account
         return self.client.post(
-            f"/api/accounts/{self.account.account_number}/deposit/",
+            f"/api/accounts/{account.account_number}/deposit/",
             {"amount": amount}, format="json", HTTP_IDEMPOTENCY_KEY=idem_key,
         )
 
     def test_requires_idempotency_key(self):
         resp = self.client.post(
-            f"/api/accounts/{self.account.account_number}/deposit/",
+            f"/api/accounts/{self.bank_account.account_number}/deposit/",
             {"amount": "50.00"}, format="json",
         )
         self.assertEqual(resp.status_code, 400)
@@ -179,9 +184,26 @@ class DepositAPITests(APITestCase):
         self._deposit("dep-2")
         resp = self._deposit("dep-2")
         self.assertEqual(resp.data["balance"], "50.00")
-        self.account.refresh_from_db()
-        self.assertEqual(self.account.balance_minor, 5000)
+        self.bank_account.refresh_from_db()
+        self.assertEqual(self.bank_account.balance_minor, 5000)
         self.assertEqual(Deposit.objects.filter(idempotency_key="dep-2").count(), 1)
+        self.assertEqual(Entry.objects.filter(deposit__idempotency_key="dep-2").count(), 1)
+
+    def test_deposit_writes_a_single_sided_entry_visible_in_transactions(self):
+        self._deposit("dep-entry-1", amount="500.00")
+
+        entry = Entry.objects.get(deposit__idempotency_key="dep-entry-1")
+        self.assertEqual(entry.account_id, self.bank_account.id)
+        self.assertEqual(entry.amount_minor, 50000)
+        self.assertIsNone(entry.transfer_id)
+
+        resp = self.client.get(f"/api/accounts/{self.bank_account.account_number}/transactions/")
+        self.assertEqual(resp.status_code, 200)
+        results = resp.data["results"]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["direction"], "credit")
+        self.assertEqual(results[0]["amount"], "500.00")
+        self.assertEqual(results[0]["counterparty_account_number"], "EXTERNAL")
 
     def test_conflicting_key_reuse_rejected(self):
         self._deposit("dep-3", amount="50.00")
@@ -192,6 +214,42 @@ class DepositAPITests(APITestCase):
         self.client.force_authenticate(user=self.alice)
         resp = self._deposit("dep-4")
         self.assertEqual(resp.status_code, 403)
+
+    def test_staff_but_not_superuser_forbidden(self):
+        """is_staff alone is no longer enough -- must be a real superuser."""
+        self.client.force_authenticate(user=self.staff)
+        resp = self._deposit("dep-5")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_admin_cannot_deposit_into_someone_elses_account(self):
+        """Admin can only fund their own (bank) account -- customers get
+        funded via a transfer from that account instead."""
+        resp = self._deposit("dep-6", account=self.account)
+        self.assertEqual(resp.status_code, 403)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.balance_minor, 0)
+
+    def test_customer_funded_via_transfer_from_bank_account(self):
+        """The intended real flow: admin deposits into the bank account,
+        then moves money to a customer with an ordinary transfer -- which
+        means it shows up in both accounts' ledgers."""
+        self._deposit("dep-7", amount="100.00")
+
+        resp = self.client.post(
+            "/api/accounts/transfers/",
+            {
+                "source_account": self.bank_account.account_number,
+                "destination_account": self.account.account_number,
+                "amount": "40.00",
+            },
+            format="json",
+            HTTP_IDEMPOTENCY_KEY="fund-alice-1",
+        )
+        self.assertEqual(resp.status_code, 201, resp.data)
+
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.balance_minor, 4000)
+        self.assertEqual(Entry.objects.filter(account=self.account).count(), 1)
 
 
 class ConservationInvariantTests(APITestCase):
