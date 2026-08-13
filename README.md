@@ -118,3 +118,62 @@ the server is running. Admin panel at `/admin/`.
 | `POST /api/accounts/transfers/` | Requires `Idempotency-Key` header. See below. |
 | `GET /api/accounts/transfers/<id>/` | Status lookup, restricted to the two accounts involved. |
 | `POST /api/accounts/<account_number>/deposit/` | Superuser only, and only into their own account. Requires `Idempotency-Key`. This is the system's sole entry point for new money -- funding a customer account happens via a normal transfer from here, not another deposit call. |
+
+## Design decisions
+
+- **Balances are integer minor units** (cents), never floats, with a DB
+  `CheckConstraint` enforcing `balance >= 0` -- so "never negative" can't be
+  bypassed by a bug in application code, only by a DB-level constraint
+  violation.
+- **Double-entry ledger.** Every transfer writes two `Entry` rows (a debit
+  and a credit) that sum to zero, instead of just mutating balances in
+  place. This gives an audit trail for free and makes conservation
+  independently checkable by summing entries.
+- **Deposits are the only way money enters the system**, and only a
+  superuser can deposit, only into their own account. Funding a customer
+  happens via an ordinary transfer from that account. This keeps "money
+  creation" to one narrow, auditable path instead of many.
+- **Redis is a non-authoritative accelerator, not a dependency.** It caches
+  idempotent-replay responses for speed; if it's down, every request just
+  falls through to Postgres and gets the same correct (if slower) answer.
+
+## How the hard requirements are met
+
+**Idempotency.** `Idempotency-Key` is a DB `UNIQUE` constraint on `Transfer`
+(and `Deposit`). The first request to use a key wins; a retry (or a losing
+concurrent request) hits an `IntegrityError`, looks up the row that already
+won, and replays its result instead of moving money again. Redis sits in
+front of this as a fast path only -- a miss or a down cache still lands on
+the same DB constraint and the same correct outcome.
+
+**Conservation.** Debiting the source and crediting the destination happens
+inside one atomic transaction -- both writes commit or neither does. The
+`balance >= 0` constraint is enforced by Postgres itself, not app code, so
+it holds even against a bug or a bypassed code path.
+
+**Concurrency across multiple instances.** Both accounts in a transfer are
+locked with `SELECT FOR UPDATE` (always in a fixed, id-ascending order, to
+avoid deadlocking against a concurrent transfer in the opposite direction)
+before either balance is read or changed. That lock -- and the idempotency
+constraint above -- live in Postgres, the one thing every instance shares.
+So it doesn't matter which stateless instance handles a given request, or
+whether a request and its retry land on different instances: two instances
+racing on the same account serialize at the DB row lock, not in memory, and
+a retry racing its original request resolves at the DB constraint, not in
+a process-local cache.
+
+## What I left out
+
+- **Rate limiting.** Would add per-user throttling on transfer/deposit
+  before this went anywhere near production.
+- **Multi-currency.** Everything assumes a single currency (USD); no
+  conversion.
+- **General audit log.** The ledger covers money movement, but there's no
+  audit trail for other actions (e.g. an admin editing a user). Django
+  admin's built-in log exists but isn't surfaced anywhere.
+- **Account closure API.** `Account` has the soft-delete fields, but the
+  only way to actually close one today is the Django admin action -- no
+  public endpoint.
+
+Given more time, account closure and rate limiting are what I'd build next
+-- both are small, well-scoped additions on top of what's already there.
