@@ -29,13 +29,18 @@ class RegisterSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 "Provide either a CNIC or a passport number."
             )
+
+        errors = {}
+        if cnic and User.objects.filter(cnic=cnic).exists():
+            errors["cnic"] = ["A user with this CNIC already exists."]
+        if passport_number and User.objects.filter(passport_number=passport_number).exists():
+            errors["passport_number"] = ["A user with this passport number already exists."]
+        if errors:
+            raise serializers.ValidationError(errors)
+
         attrs["cnic"] = cnic
         attrs["passport_number"] = passport_number
 
-        # AUTH_PASSWORD_VALIDATORS is configured but nothing was calling it --
-        # create_user() just does set_password(), no strength check. Run it
-        # here. Unsaved user instance lets UserAttributeSimilarityValidator
-        # check the password isn't just the email/name.
         temp_user = User(
             email=attrs.get("email"),
             first_name=attrs.get("first_name"),

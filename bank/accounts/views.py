@@ -1,5 +1,6 @@
 import hashlib
 
+from django.core.cache import cache
 from django.db import IntegrityError, transaction
 from django.db.models import Q
 from drf_spectacular.utils import OpenApiParameter, extend_schema
@@ -20,8 +21,12 @@ from .serializers import (
 )
 
 
+def _can_see_all_accounts(user):
+    return user.is_staff or user.is_superuser
+
+
 class AccountListCreateView(generics.ListCreateAPIView):
-    """Own accounts only; staff see every account (and can pass
+    """Own accounts only; staff/admin see every account (and can pass
     owner_bank_user_id to create one for someone else). New accounts
     always start at $0."""
 
@@ -30,7 +35,7 @@ class AccountListCreateView(generics.ListCreateAPIView):
 
     def get_queryset(self):
         qs = Account.objects.select_related("owner").filter(is_deleted=False)
-        if not self.request.user.is_staff:
+        if not _can_see_all_accounts(self.request.user):
             qs = qs.filter(owner=self.request.user)
         return qs.order_by("-created_at")
 
@@ -49,7 +54,7 @@ class AccountListCreateView(generics.ListCreateAPIView):
 
 
 class AccountDetailView(generics.RetrieveAPIView):
-    """Owner or staff. Non-owner gets 404, not 403 (no enumeration)."""
+    """Owner or staff/admin. Non-owner gets 404, not 403 (no enumeration)."""
 
     serializer_class = AccountSerializer
     lookup_field = "account_number"
@@ -57,7 +62,7 @@ class AccountDetailView(generics.RetrieveAPIView):
 
     def get_queryset(self):
         qs = Account.objects.select_related("owner").filter(is_deleted=False)
-        if not self.request.user.is_staff:
+        if not _can_see_all_accounts(self.request.user):
             qs = qs.filter(owner=self.request.user)
         return qs
 
@@ -70,7 +75,7 @@ class EntryCursorPagination(CursorPagination):
 
 
 class AccountTransactionsView(generics.ListAPIView):
-    """Owner or staff. Ledger history, newest first, cursor-paginated."""
+    """Owner or staff/admin. Ledger history, newest first, cursor-paginated."""
 
     serializer_class = EntrySerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -79,7 +84,7 @@ class AccountTransactionsView(generics.ListAPIView):
     def get_queryset(self):
         account_number = self.kwargs["account_number"]
         accounts = Account.objects.filter(account_number=account_number, is_deleted=False)
-        if not self.request.user.is_staff:
+        if not _can_see_all_accounts(self.request.user):
             accounts = accounts.filter(owner=self.request.user)
         account = accounts.first()
         if account is None:
@@ -93,9 +98,49 @@ class AccountTransactionsView(generics.ListAPIView):
         )
 
 
-def _compute_request_hash(source_account_id, destination_account_id, amount_minor):
-    raw = f"{source_account_id}:{destination_account_id}:{amount_minor}"
+class TransferCursorPagination(CursorPagination):
+    page_size = 25
+    max_page_size = 100
+    page_size_query_param = "page_size"
+    ordering = ("-created_at", "-id")  # -id breaks ties on identical timestamps
+
+
+class AccountTransfersView(generics.ListAPIView):
+    """Owner or staff/admin. Every transfer attempt involving this account,
+    newest first -- including FAILED ones (unlike /transactions/, which only
+    shows Entry rows for money that actually moved)."""
+
+    serializer_class = TransferResultSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    pagination_class = TransferCursorPagination
+
+    def get_queryset(self):
+        account_number = self.kwargs["account_number"]
+        accounts = Account.objects.filter(account_number=account_number, is_deleted=False)
+        if not _can_see_all_accounts(self.request.user):
+            accounts = accounts.filter(owner=self.request.user)
+        account = accounts.first()
+        if account is None:
+            return Transfer.objects.none()
+        return (
+            Transfer.objects.filter(Q(source_account=account) | Q(destination_account=account))
+            .select_related("source_account", "destination_account")
+            .order_by("-created_at")
+        )
+
+
+def _compute_request_hash(source_account_number, destination_account_number, amount_component):
+
+    raw = f"{source_account_number}:{destination_account_number}:{amount_component}"
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+# Cache window for a completed/failed transfer's response
+TRANSFER_CACHE_TTL_SECONDS = 60 * 60 * 24
+
+
+def _transfer_cache_key(idempotency_key):
+    return f"transfer:idem:{idempotency_key}"
 
 
 class TransferView(APIView):
@@ -130,16 +175,34 @@ class TransferView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        try:
+            amount_component = money.to_minor_units(str(request.data.get("amount", "")))
+        except ValueError:
+            amount_component = f"invalid:{request.data.get('amount')!r}"
+
+        request_hash = _compute_request_hash(
+            request.data.get("source_account", ""),
+            request.data.get("destination_account", ""),
+            amount_component,
+        )
+        cache_key = _transfer_cache_key(idempotency_key)
+
+        # Redis fast path -- keyed on idempotency_key
+        cached = cache.get(cache_key)
+        if cached is not None:
+            if cached["request_hash"] == request_hash:
+                return Response(cached["data"], status=cached["status"])
+            return Response(
+                {"detail": "Idempotency-Key was already used with a different request."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
         serializer = TransferSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
 
         source_account = serializer.validated_data["source_account_obj"]
         destination_account = serializer.validated_data["destination_account_obj"]
         amount_minor = serializer.validated_data["amount_minor"]
-
-        request_hash = _compute_request_hash(
-            source_account.id, destination_account.id, amount_minor
-        )
 
         with transaction.atomic():
             try:
@@ -156,19 +219,22 @@ class TransferView(APIView):
                         status=Transfer.Status.PENDING,
                     )
             except IntegrityError:
-                # Key already used; conflicting row is guaranteed committed.
                 existing = Transfer.objects.select_related(
                     "source_account", "destination_account"
                 ).get(idempotency_key=idempotency_key)
+                response_data = TransferResultSerializer(existing).data
+                response_status = self._status_for(existing.status)
+                cache.set(
+                    cache_key,
+                    {"request_hash": existing.request_hash, "data": response_data, "status": response_status},
+                    TRANSFER_CACHE_TTL_SECONDS,
+                )
                 if existing.request_hash != request_hash:
                     return Response(
                         {"detail": "Idempotency-Key was already used with a different request."},
                         status=status.HTTP_409_CONFLICT,
                     )
-                return Response(
-                    TransferResultSerializer(existing).data,
-                    status=self._status_for(existing.status),
-                )
+                return Response(response_data, status=response_status)
 
             # Lock both accounts in a fixed (id-ascending) order to avoid deadlock.
             locked = {
@@ -206,10 +272,14 @@ class TransferView(APIView):
                 transfer.failure_reason = "insufficient_funds"
                 transfer.save(update_fields=["status", "failure_reason", "updated_at"])
 
-        return Response(
-            TransferResultSerializer(transfer).data,
-            status=self._status_for(transfer.status),
+        response_data = TransferResultSerializer(transfer).data
+        response_status = self._status_for(transfer.status)
+        cache.set(
+            cache_key,
+            {"request_hash": request_hash, "data": response_data, "status": response_status},
+            TRANSFER_CACHE_TTL_SECONDS,
         )
+        return Response(response_data, status=response_status)
 
     @staticmethod
     def _status_for(transfer_status):
@@ -229,7 +299,7 @@ class TransferDetailView(generics.RetrieveAPIView):
     def get_queryset(self):
         user = self.request.user
         qs = Transfer.objects.select_related("source_account", "destination_account")
-        if user.is_staff:
+        if _can_see_all_accounts(user):
             return qs
         return qs.filter(Q(source_account__owner=user) | Q(destination_account__owner=user))
 

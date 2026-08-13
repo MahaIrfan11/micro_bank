@@ -1,15 +1,23 @@
 import threading
 from decimal import Decimal
 
-from django.db import IntegrityError, transaction
+from django.core.cache import cache
+from django.db import IntegrityError, connection, transaction
 from django.db.models import Sum
-from django.test import TestCase, TransactionTestCase
+from django.test import TestCase, TransactionTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
+from django.urls import reverse
 from rest_framework.test import APIClient, APITestCase
 
 from users.tests import make_user
 
 from . import money
 from .models import Account, Deposit, Entry, Transfer
+
+
+LOCMEM_CACHES = {
+    "default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}
+}
 
 
 class MoneyUtilsTests(TestCase):
@@ -75,8 +83,11 @@ class AccountModelTests(TestCase):
         self.assertEqual(Account.objects.filter(owner=self.owner).count(), 2)
 
 
+@override_settings(CACHES=LOCMEM_CACHES)
 class TransferAPITests(APITestCase):
+
     def setUp(self):
+        cache.clear()
         self.alice = make_user("alice@example.com")
         self.bob = make_user("bob@example.com")
         self.acct_a = Account.objects.create(owner=self.alice, account_type="CURRENT", balance_minor=10000)
@@ -149,11 +160,155 @@ class TransferAPITests(APITestCase):
         resp = self._transfer("key-6")
         self.assertEqual(resp.status_code, 400)
 
+    @override_settings(CACHES=LOCMEM_CACHES)
+    def test_retry_is_served_from_cache_with_zero_db_queries(self):
+        from .views import _compute_request_hash, _transfer_cache_key
 
-class DepositAPITests(APITestCase):
-    """Only a superuser can deposit, and only into their own (bank) account."""
+        first = self._transfer("key-cache-1")
+        self.assertEqual(first.status_code, 201, first.data)
+
+        # The cached entry exists, keyed on the idempotency key alone, and
+        # carries both the request's fingerprint and the response to replay.
+        request_hash = _compute_request_hash(
+            self.acct_a.account_number, self.acct_b.account_number, 3000
+        )
+        cached = cache.get(_transfer_cache_key("key-cache-1"))
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached["request_hash"], request_hash)
+        self.assertEqual(cached["data"]["id"], first.data["id"])
+
+        # A retry is answered entirely from cache -- no Postgres round trip at all.
+        with CaptureQueriesContext(connection) as ctx:
+            second = self._transfer("key-cache-1")
+        self.assertEqual(second.status_code, 201)
+        self.assertEqual(second.data["id"], first.data["id"])
+        self.assertEqual(len(ctx.captured_queries), 0)
+        self.assertEqual(Transfer.objects.filter(idempotency_key="key-cache-1").count(), 1)
+
+    @override_settings(CACHES=LOCMEM_CACHES)
+    def test_conflicting_payload_gets_409_from_cache_with_zero_db_queries(self):
+        """Same key, different amount -- still 409, and once the canonical
+        transfer is cached, later conflicts don't need Postgres to know that."""
+        first = self._transfer("key-cache-2", amount="30.00")
+        self.assertEqual(first.status_code, 201, first.data)
+
+        with CaptureQueriesContext(connection) as ctx:
+            resp = self._transfer("key-cache-2", amount="5.00")
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(len(ctx.captured_queries), 0)
+
+        # And a genuinely matching retry still replays the original -- the
+        # cache entry wasn't corrupted by the conflicting attempt in between.
+        third = self._transfer("key-cache-2", amount="30.00")
+        self.assertEqual(third.status_code, 201)
+        self.assertEqual(third.data["id"], first.data["id"])
+
+    @override_settings(CACHES=LOCMEM_CACHES)
+    def test_first_ever_conflicting_payload_is_still_caught_by_postgres(self):
+        """Cold cache (e.g. after a restart) -- the DB's UNIQUE constraint is
+        still the real backstop, cache or no cache."""
+        first = self._transfer("key-cache-cold", amount="30.00")
+        self.assertEqual(first.status_code, 201, first.data)
+
+        cache.clear()  # simulate a cold cache -- TTL expiry, eviction, Redis restart
+        resp = self._transfer("key-cache-cold", amount="5.00")
+        self.assertEqual(resp.status_code, 409)
+
+    @override_settings(CACHES=LOCMEM_CACHES)
+    def test_failed_transfer_is_also_cached(self):
+        """Insufficient-funds failures are stable replay targets too."""
+        first = self._transfer("key-cache-3", amount="99999.00")
+        self.assertEqual(first.status_code, 422)
+        self.assertEqual(first.data["status"], "FAILED")
+
+        second = self._transfer("key-cache-3", amount="99999.00")
+        self.assertEqual(second.status_code, 422)
+        self.assertEqual(second.data["id"], first.data["id"])
+
+
+@override_settings(CACHES=LOCMEM_CACHES)
+class AccountTransfersListTests(APITestCase):
+    """GET /accounts/<n>/transfers/ -- every attempt (including FAILED),
+    unlike /transactions/ which only shows completed money movements.
+    CACHES overridden + cache.clear() in setUp -- see TransferAPITests for why."""
 
     def setUp(self):
+        cache.clear()
+        self.alice = make_user("alice6@example.com")
+        self.bob = make_user("bob6@example.com")
+        self.carol = make_user("carol6@example.com")
+        self.acct_a = Account.objects.create(owner=self.alice, account_type="CURRENT", balance_minor=10000)
+        self.acct_b = Account.objects.create(owner=self.bob, account_type="CURRENT", balance_minor=0)
+        self.client.force_authenticate(user=self.alice)
+
+    def _transfer(self, idem_key, source, destination, amount):
+        return self.client.post(
+            "/api/accounts/transfers/",
+            {"source_account": source, "destination_account": destination, "amount": amount},
+            format="json",
+            HTTP_IDEMPOTENCY_KEY=idem_key,
+        )
+
+    def test_lists_both_successful_and_failed_transfers(self):
+        self._transfer("tlist-1", self.acct_a.account_number, self.acct_b.account_number, "30.00")
+        self._transfer("tlist-2", self.acct_a.account_number, self.acct_b.account_number, "99999.00")
+
+        resp = self.client.get(f"/api/accounts/{self.acct_a.account_number}/transfers/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data["results"]), 2)
+        statuses = {t["status"] for t in resp.data["results"]}
+        self.assertEqual(statuses, {"COMPLETED", "FAILED"})
+        failed = next(t for t in resp.data["results"] if t["status"] == "FAILED")
+        self.assertEqual(failed["failure_reason"], "insufficient_funds")
+
+    def test_shows_transfers_where_account_is_either_side(self):
+        self._transfer("tlist-3", self.acct_a.account_number, self.acct_b.account_number, "10.00")
+
+        # setUp authenticates as alice, but acct_b belongs to bob -- switch
+        # to its actual owner, since a non-owner/non-staff user correctly
+        # gets an empty (not 403) result from this endpoint by design.
+        self.client.force_authenticate(user=self.bob)
+        resp = self.client.get(f"/api/accounts/{self.acct_b.account_number}/transfers/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data["results"]), 1)
+        self.assertEqual(resp.data["results"][0]["destination_account"], self.acct_b.account_number)
+
+    def test_newest_first(self):
+        self._transfer("tlist-4", self.acct_a.account_number, self.acct_b.account_number, "10.00")
+        self._transfer("tlist-5", self.acct_a.account_number, self.acct_b.account_number, "10.00")
+
+        resp = self.client.get(f"/api/accounts/{self.acct_a.account_number}/transfers/")
+        ids = [t["id"] for t in resp.data["results"]]
+        transfer_4 = Transfer.objects.get(idempotency_key="tlist-4")
+        transfer_5 = Transfer.objects.get(idempotency_key="tlist-5")
+        self.assertEqual(ids, [str(transfer_5.id), str(transfer_4.id)])
+
+    def test_non_owner_non_staff_sees_empty_result_not_someone_elses_data(self):
+        self._transfer("tlist-6", self.acct_a.account_number, self.acct_b.account_number, "10.00")
+
+        self.client.force_authenticate(user=self.carol)
+        resp = self.client.get(f"/api/accounts/{self.acct_a.account_number}/transfers/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["results"], [])
+
+    def test_staff_and_superuser_can_see_any_accounts_transfers(self):
+        self._transfer("tlist-7", self.acct_a.account_number, self.acct_b.account_number, "10.00")
+
+        admin = make_user("admin7@example.com", is_staff=False, is_superuser=True)
+        self.client.force_authenticate(user=admin)
+        resp = self.client.get(f"/api/accounts/{self.acct_a.account_number}/transfers/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data["results"]), 1)
+
+
+@override_settings(CACHES=LOCMEM_CACHES)
+class DepositAPITests(APITestCase):
+    """Only a superuser can deposit, and only into their own (bank) account.
+    CACHES overridden + cache.clear() in setUp -- one test here also calls
+    /transfers/ with a hardcoded Idempotency-Key; see TransferAPITests."""
+
+    def setUp(self):
+        cache.clear()
         self.admin = make_user("admin2@example.com", is_staff=True, is_superuser=True)
         self.staff = make_user("staff2@example.com", is_staff=True)
         self.alice = make_user("alice2@example.com")
@@ -252,10 +407,94 @@ class DepositAPITests(APITestCase):
         self.assertEqual(Entry.objects.filter(account=self.account).count(), 1)
 
 
+@override_settings(CACHES=LOCMEM_CACHES)
+class AdminAccountVisibilityTests(APITestCase):
+    """CACHES overridden -- see TransferAPITests for why.
+
+    A true superuser sees every account/transfer even if is_staff wasn't
+    also set (e.g. provisioned by hand rather than via create_superuser)."""
+
+    def setUp(self):
+        cache.clear()
+        self.superuser_only = make_user(
+            "superonly@example.com", is_staff=False, is_superuser=True
+        )
+        self.staff_only = make_user(
+            "staffonly@example.com", is_staff=True, is_superuser=False
+        )
+        self.alice = make_user("alice5@example.com")
+        self.bob = make_user("bob5@example.com")
+        self.acct_a = Account.objects.create(
+            owner=self.alice, account_type="CURRENT", balance_minor=10000
+        )
+        self.acct_b = Account.objects.create(
+            owner=self.bob, account_type="CURRENT", balance_minor=0
+        )
+
+        self.client.force_authenticate(user=self.alice)
+        transfer_resp = self.client.post(
+            "/api/accounts/transfers/",
+            {
+                "source_account": self.acct_a.account_number,
+                "destination_account": self.acct_b.account_number,
+                "amount": "10.00",
+            },
+            format="json",
+            HTTP_IDEMPOTENCY_KEY="visibility-setup-1",
+        )
+        self.transfer_id = transfer_resp.data["id"]
+
+    def test_superuser_without_is_staff_can_list_all_accounts(self):
+        self.client.force_authenticate(user=self.superuser_only)
+        resp = self.client.get("/api/accounts/")
+        self.assertEqual(resp.status_code, 200)
+        numbers = {a["account_number"] for a in resp.data}
+        self.assertIn(self.acct_a.account_number, numbers)
+        self.assertIn(self.acct_b.account_number, numbers)
+
+    def test_staff_without_superuser_can_still_list_all_accounts(self):
+        """Existing is_staff behaviour must keep working alongside the fix."""
+        self.client.force_authenticate(user=self.staff_only)
+        resp = self.client.get("/api/accounts/")
+        self.assertEqual(resp.status_code, 200)
+        numbers = {a["account_number"] for a in resp.data}
+        self.assertIn(self.acct_a.account_number, numbers)
+        self.assertIn(self.acct_b.account_number, numbers)
+
+    def test_regular_user_still_only_sees_own_accounts(self):
+        self.client.force_authenticate(user=self.alice)
+        resp = self.client.get("/api/accounts/")
+        self.assertEqual(resp.status_code, 200)
+        numbers = {a["account_number"] for a in resp.data}
+        self.assertIn(self.acct_a.account_number, numbers)
+        self.assertNotIn(self.acct_b.account_number, numbers)
+
+    def test_superuser_without_is_staff_can_retrieve_any_account_detail(self):
+        self.client.force_authenticate(user=self.superuser_only)
+        resp = self.client.get(f"/api/accounts/{self.acct_b.account_number}/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["account_number"], self.acct_b.account_number)
+
+    def test_superuser_without_is_staff_can_see_any_accounts_transactions(self):
+        self.client.force_authenticate(user=self.superuser_only)
+        resp = self.client.get(f"/api/accounts/{self.acct_b.account_number}/transactions/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data["results"]), 1)
+
+    def test_superuser_without_is_staff_can_see_any_transfer(self):
+        self.client.force_authenticate(user=self.superuser_only)
+        resp = self.client.get(f"/api/accounts/transfers/{self.transfer_id}/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["id"], self.transfer_id)
+
+
+@override_settings(CACHES=LOCMEM_CACHES)
 class ConservationInvariantTests(APITestCase):
-    """Total money must never change from transfers alone."""
+    """Total money must never change from transfers alone.
+    CACHES overridden + cache.clear() -- see TransferAPITests for why."""
 
     def test_total_balance_conserved_across_multiple_transfers(self):
+        cache.clear()
         alice = make_user("alice4@example.com")
         bob = make_user("bob4@example.com")
         carol = make_user("carol4@example.com")
@@ -284,10 +523,13 @@ class ConservationInvariantTests(APITestCase):
         self.assertEqual(Entry.objects.aggregate(Sum("amount_minor"))["amount_minor__sum"], 0)
 
 
+@override_settings(CACHES=LOCMEM_CACHES)
 class ConcurrencyTests(TransactionTestCase):
-    """Real threads/connections -- TestCase's shared transaction would hide races."""
+    """Real threads/connections -- TestCase's shared transaction would hide races.
+    CACHES overridden + cache.clear() in setUp -- see TransferAPITests for why."""
 
     def setUp(self):
+        cache.clear()
         self.alice = make_user("alice3@example.com")
         self.bob = make_user("bob3@example.com")
         self.carol = make_user("carol3@example.com")
@@ -361,3 +603,57 @@ class ConcurrencyTests(TransactionTestCase):
 
         self.account.refresh_from_db()
         self.assertEqual(self.account.balance_minor, 9000)  # exactly one $10 debit, not five
+
+
+class AccountAdminTests(TestCase):
+    """The Django admin must never permanently delete an account row."""
+
+    def setUp(self):
+        self.staff_admin = make_user(
+            "adminpanel1@example.com", is_staff=True, is_superuser=True
+        )
+        self.owner = make_user("panelowner1@example.com")
+        self.empty_account = Account.objects.create(
+            owner=self.owner, account_type="CURRENT", balance_minor=0
+        )
+        self.funded_account = Account.objects.create(
+            owner=self.owner, account_type="SAVINGS", balance_minor=5000
+        )
+        self.client.force_login(self.staff_admin)
+
+    def test_delete_confirmation_page_is_forbidden(self):
+        url = reverse("admin:accounts_account_delete", args=[self.empty_account.pk])
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 403)
+
+    def test_delete_selected_bulk_action_is_not_offered(self):
+        resp = self.client.get(reverse("admin:accounts_account_changelist"))
+        self.assertEqual(resp.status_code, 200)
+        # Exact attribute match -- "delete_selected" alone would also match
+        # inside our own "soft_delete_selected" action's <option value=...>.
+        self.assertNotContains(resp, 'value="delete_selected"')
+
+    def test_soft_delete_action_closes_a_zero_balance_account(self):
+        resp = self.client.post(
+            reverse("admin:accounts_account_changelist"),
+            {"action": "soft_delete_selected", "_selected_action": [str(self.empty_account.pk)]},
+            follow=True,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.empty_account.refresh_from_db()
+        self.assertTrue(self.empty_account.is_deleted)
+        self.assertFalse(self.empty_account.is_active)
+        self.assertIsNotNone(self.empty_account.deleted_at)
+        # Row still exists -- this was a soft delete, not a real one.
+        self.assertTrue(Account.objects.filter(pk=self.empty_account.pk).exists())
+
+    def test_soft_delete_action_refuses_a_funded_account(self):
+        resp = self.client.post(
+            reverse("admin:accounts_account_changelist"),
+            {"action": "soft_delete_selected", "_selected_action": [str(self.funded_account.pk)]},
+            follow=True,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.funded_account.refresh_from_db()
+        self.assertFalse(self.funded_account.is_deleted)
+        self.assertEqual(self.funded_account.balance_minor, 5000)

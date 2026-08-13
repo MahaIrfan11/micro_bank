@@ -1,3 +1,5 @@
+import uuid
+
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
@@ -25,10 +27,10 @@ class AccountSerializer(serializers.ModelSerializer):
             "is_active", "created_at",
         ]
 
-    def get_balance(self, obj):
+    def get_balance(self, obj) -> str:
         return money.format_amount(obj.balance_minor)
 
-    def get_owner_name(self, obj):
+    def get_owner_name(self, obj) -> str:
         return f"{obj.owner.first_name} {obj.owner.last_name}"
 
     def validate(self, attrs):
@@ -66,20 +68,20 @@ class EntrySerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
 
-    def get_amount(self, obj):
+    def get_amount(self, obj) -> str:
         return money.format_amount(abs(obj.amount_minor))
 
-    def get_balance_after(self, obj):
+    def get_balance_after(self, obj) -> str:
         return money.format_amount(obj.balance_after_minor)
 
-    def get_direction(self, obj):
+    def get_direction(self, obj) -> str:
         return "credit" if obj.amount_minor > 0 else "debit"
 
-    def get_transfer_id(self, obj):
+    def get_transfer_id(self, obj) -> uuid.UUID | None:
         # None for deposit-originated entries -- there's no Transfer to point at.
         return obj.transfer_id
 
-    def get_counterparty_account_number(self, obj):
+    def get_counterparty_account_number(self, obj) -> str:
         if obj.transfer_id is None:
             # Deposit-originated -- money entering the system, no counterparty account.
             return "EXTERNAL"
@@ -157,7 +159,7 @@ class TransferResultSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
 
-    def get_amount(self, obj):
+    def get_amount(self, obj) -> str:
         return money.format_amount(obj.amount_minor)
 
 

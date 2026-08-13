@@ -1,3 +1,4 @@
+from django.db import IntegrityError
 from rest_framework import generics, permissions
 from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import CursorPagination
@@ -22,6 +23,15 @@ def _soft_delete_or_raise(instance):
     instance.soft_delete()
 
 
+def _raise_clean_error_for_unique_violation(exc):
+    constraint = getattr(getattr(exc.__cause__, "diag", None), "constraint_name", "") or ""
+    if "cnic" in constraint:
+        raise ValidationError({"cnic": ["A user with this CNIC already exists."]}) from exc
+    if "passport_number" in constraint:
+        raise ValidationError({"passport_number": ["A user with this passport number already exists."]}) from exc
+    raise exc
+
+
 class RegisterView(generics.CreateAPIView):
     serializer_class = RegisterSerializer
     permission_classes = [permissions.AllowAny]
@@ -29,7 +39,10 @@ class RegisterView(generics.CreateAPIView):
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = serializer.save()
+        try:
+            user = serializer.save()
+        except IntegrityError as exc:
+            _raise_clean_error_for_unique_violation(exc)
         return Response(UserSerializer(user).data, status=201)
 
 
@@ -78,7 +91,10 @@ class AdminUserListView(generics.ListCreateAPIView):
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = serializer.save()
+        try:
+            user = serializer.save()
+        except IntegrityError as exc:
+            _raise_clean_error_for_unique_violation(exc)
         return Response(AdminUserSerializer(user).data, status=201)
 
 

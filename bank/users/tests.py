@@ -2,6 +2,7 @@ import itertools
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
+from django.urls import reverse
 from rest_framework.test import APITestCase
 
 from accounts.models import Account
@@ -68,6 +69,24 @@ class SignupAPITests(APITestCase):
         }, format="json")
         self.assertEqual(resp.status_code, 400)
 
+    def test_signup_rejects_duplicate_cnic_with_400_not_500(self):
+        make_user("first@example.com", cnic="9999999999999")
+        resp = self.client.post("/api/users/signup/", {
+            "email": "second@example.com", "password": "GoodPass123!", "phone_number": "5551234599",
+            "first_name": "Second", "last_name": "User", "cnic": "9999999999999",
+        }, format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("cnic", resp.data)
+
+    def test_signup_rejects_duplicate_passport_number_with_400_not_500(self):
+        make_user("firstpp@example.com", cnic=None, passport_number="string")
+        resp = self.client.post("/api/users/signup/", {
+            "email": "secondpp@example.com", "password": "GoodPass123!", "phone_number": "5551234598",
+            "first_name": "Second", "last_name": "Passport", "passport_number": "string",
+        }, format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("passport_number", resp.data)
+
     def test_signup_then_login(self):
         resp = self.client.post("/api/users/signup/", {
             "email": "newuser@example.com", "password": "GoodPass123!", "phone_number": "5551234569",
@@ -123,3 +142,58 @@ class AdminUserCreateAPITests(APITestCase):
             "first_name": "X", "last_name": "Y", "cnic": "4444444444444",
         }, format="json")
         self.assertEqual(resp.status_code, 403)
+
+
+class UserAdminTests(TestCase):
+    """The Django admin must never permanently delete a user row."""
+
+    def setUp(self):
+        self.staff_admin = make_user(
+            "adminpanel2@example.com", is_staff=True, is_superuser=True
+        )
+        self.free_user = make_user("panelfree@example.com")
+        self.holder = make_user("panelholder@example.com")
+        Account.objects.create(owner=self.holder, account_type="CURRENT")
+        self.client.force_login(self.staff_admin)
+
+    def test_delete_confirmation_page_is_forbidden(self):
+        url = reverse("admin:users_user_delete", args=[self.free_user.pk])
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 403)
+
+    def test_add_page_is_forbidden(self):
+        # Users are created via the signup / admin-create API (which hashes
+        # passwords and enforces cnic/passport rules), not a raw admin form.
+        resp = self.client.get(reverse("admin:users_user_add"))
+        self.assertEqual(resp.status_code, 403)
+
+    def test_delete_selected_bulk_action_is_not_offered(self):
+        resp = self.client.get(reverse("admin:users_user_changelist"))
+        self.assertEqual(resp.status_code, 200)
+        # Exact attribute match -- "delete_selected" alone would also match
+        # inside our own "soft_delete_selected" action's <option value=...>.
+        self.assertNotContains(resp, 'value="delete_selected"')
+
+    def test_soft_delete_action_deactivates_a_user_without_open_accounts(self):
+        resp = self.client.post(
+            reverse("admin:users_user_changelist"),
+            {"action": "soft_delete_selected", "_selected_action": [str(self.free_user.pk)]},
+            follow=True,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.free_user.refresh_from_db()
+        self.assertTrue(self.free_user.is_deleted)
+        self.assertFalse(self.free_user.is_active)
+        # Row still exists -- this was a soft delete, not a real one.
+        self.assertTrue(User.objects.filter(pk=self.free_user.pk).exists())
+
+    def test_soft_delete_action_refuses_a_user_with_an_open_account(self):
+        resp = self.client.post(
+            reverse("admin:users_user_changelist"),
+            {"action": "soft_delete_selected", "_selected_action": [str(self.holder.pk)]},
+            follow=True,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.holder.refresh_from_db()
+        self.assertFalse(self.holder.is_deleted)
+        self.assertTrue(self.holder.is_active)

@@ -5,6 +5,7 @@ from .views import (
     AccountDetailView,
     AccountListCreateView,
     AccountTransactionsView,
+    AccountTransfersView,
     TransferDetailView,
     TransferView,
 )
@@ -15,5 +16,6 @@ urlpatterns = [
     path("transfers/<uuid:id>/", TransferDetailView.as_view()),
     path("<str:account_number>/", AccountDetailView.as_view()),
     path("<str:account_number>/transactions/", AccountTransactionsView.as_view()),
+    path("<str:account_number>/transfers/", AccountTransfersView.as_view()),
     path("<str:account_number>/deposit/", AccountDepositView.as_view()),
 ]

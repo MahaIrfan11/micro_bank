@@ -1,4 +1,5 @@
-from django.contrib import admin
+from django.contrib import admin, messages
+from django.utils import timezone
 
 from . import money
 from .models import Account, Deposit, Entry, Transfer
@@ -18,14 +19,18 @@ class ReadOnlyAdminMixin:
 
 @admin.register(Account)
 class AccountAdmin(admin.ModelAdmin):
+
     list_display = [
         "account_number", "account_type", "owner_email", "balance_display", "currency",
         "is_active", "is_deleted", "created_at",
     ]
     list_filter = ["account_type", "is_active", "is_deleted", "currency"]
     search_fields = ["account_number", "owner__email"]
-    # balance_minor readonly -- only TransferView/AccountDepositView may change it.
-    readonly_fields = ["id", "account_number", "balance_minor", "created_at", "updated_at"]
+    readonly_fields = [
+        "id", "account_number", "balance_minor", "is_deleted", "deleted_at",
+        "created_at", "updated_at",
+    ]
+    actions = ["soft_delete_selected"]
 
     @admin.display(description="Owner")
     def owner_email(self, obj):
@@ -34,6 +39,27 @@ class AccountAdmin(admin.ModelAdmin):
     @admin.display(description="Balance")
     def balance_display(self, obj):
         return money.format_amount(obj.balance_minor)
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    @admin.action(description="Soft delete selected accounts (close, never hard-delete)")
+    def soft_delete_selected(self, request, queryset):
+        candidates = queryset.filter(is_deleted=False)
+        blocked = candidates.filter(balance_minor__gt=0)
+        if blocked.exists():
+            numbers = ", ".join(blocked.values_list("account_number", flat=True))
+            self.message_user(
+                request,
+                f"Cannot close accounts with a non-zero balance: {numbers}. "
+                "Transfer the balance out first.",
+                level=messages.ERROR,
+            )
+        count = candidates.filter(balance_minor=0).update(
+            is_deleted=True, is_active=False, deleted_at=timezone.now()
+        )
+        if count:
+            self.message_user(request, f"Closed {count} account(s).", level=messages.SUCCESS)
 
 
 @admin.register(Transfer)
