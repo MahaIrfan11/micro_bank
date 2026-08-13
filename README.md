@@ -14,13 +14,14 @@ the design.
 
 - Django 6.1 + Django REST Framework
 - PostgreSQL (via Docker)
+- Redis (via Docker) -- caches completed/failed transfer responses for idempotent retries
 - SimpleJWT (stateless auth)
 - drf-spectacular (OpenAPI schema, Swagger UI, ReDoc)
 
 ## Local setup
 
 ```bash
-# 1. Start Postgres
+# 1. Start Postgres + Redis
 docker compose up -d
 
 # 2. Python environment
@@ -50,6 +51,7 @@ python manage.py runserver
 | `SECRET_KEY` | Django's signing key -- also signs JWTs. Generate your own: `python -c "import secrets; print(secrets.token_urlsafe(50))"`. Never reuse a key that's ever been committed or shared. |
 | `ALLOWED_HOSTS` | Comma-separated hostnames. Empty is fine while `DEBUG=True`; required once `DEBUG=False`. |
 | `DATABASE_NAME`, `DATABASE_USER`, `DATABASE_PASSWORD`, `DATABASE_HOST`, `DATABASE_PORT` | Must match `docker-compose.yml`. |
+| `REDIS_URL` | Cache backend for idempotent-replay lookups. If Redis is unreachable, requests just fall through to Postgres -- not a hard dependency. |
 
 ### `createsuperuser` gotcha
 
@@ -111,7 +113,8 @@ the server is running. Admin panel at `/admin/`.
 | `GET/PUT/PATCH/DELETE /api/users/<bank_user_id>/` | Staff only, full CRUD. |
 | `GET/POST /api/accounts/` | Own accounts; staff see every account and can create one for another user via `owner_bank_user_id`. Requires `account_type`: `CURRENT` or `SAVINGS`, one of each per owner max (DB-enforced). |
 | `GET /api/accounts/<account_number>/` | Owner or staff. Non-owner gets `404`, not `403` -- no account-number enumeration. |
-| `GET /api/accounts/<account_number>/transactions/` | Ledger history, cursor-paginated. |
+| `GET /api/accounts/<account_number>/transactions/` | Ledger history (successful money movements only), cursor-paginated. |
+| `GET /api/accounts/<account_number>/transfers/` | Every transfer attempt involving this account, including `FAILED` ones, cursor-paginated. |
 | `POST /api/accounts/transfers/` | Requires `Idempotency-Key` header. See below. |
 | `GET /api/accounts/transfers/<id>/` | Status lookup, restricted to the two accounts involved. |
 | `POST /api/accounts/<account_number>/deposit/` | Superuser only, and only into their own account. Requires `Idempotency-Key`. This is the system's sole entry point for new money -- funding a customer account happens via a normal transfer from here, not another deposit call. |
